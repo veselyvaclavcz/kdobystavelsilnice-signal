@@ -1,0 +1,296 @@
+# Relé signálu ze studia do webu kdobystavelsilnice.cz (design.md 2.6, 2.7).
+#
+# Patří do veřejného repozitáře veselyvaclavcz/kdobystavelsilnice-signal jako
+# .github/workflows/relay.yml. Studio při prioritní změně zapíše signal.json; relé pak
+# spustí import webu, ale jen když má web co doručit (doručitelný rozdíl mezi indexem
+# studia a živým verze.json). Opakované signály bez změny dat tedy nic nespustí.
+#
+# Plánované importy webu (první běh dne s backfillem a pak po 6 h) spouští také relé, aby každý
+# import prošel pojistkou nákladů repa webu (veřejné repo relé minuty nespotřebuje).
+#
+# Hodinový běh hlídá výpadek studia: když index studia není dostupný a některý obsah AI
+# na živém webu má ověření (verifiedUntil) do 150 min, spustí import s reason=expiry, který
+# ho smaže a nasadí. Při dostupném studiu hodinový běh nic nespouští.
+#
+# Celý skript je v tomto souboru: žádný checkout, žádné soubory z repozitáře. Token studia
+# (jen Contents) nemůže měnit workflow; token pro web je jen v Secrets (WEB_IMPORT_TOKEN,
+# fine-grained, jen repozitář webu, Actions: Read and write). Adresa studia je proměnná
+# repozitáře STUDIO_ARCHIVE_URL (veřejné API jen pro čtení).
+name: Relé
+
+on:
+  push:
+    branches: [main]
+    paths: [signal.json]
+  schedule:
+    - cron: "17 * * * *"
+    - cron: "23 0 * * *"
+    - cron: "23 6,12,18 * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: relay
+  cancel-in-progress: false
+
+jobs:
+  relay:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Doručit změny na web
+        env:
+          GH_TOKEN: ${{ secrets.WEB_IMPORT_TOKEN }}
+          STUDIO_ARCHIVE_URL: ${{ vars.STUDIO_ARCHIVE_URL }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_SCHEDULE: ${{ github.event.schedule }}
+        run: |
+          node --input-type=module <<'RELAY'
+          import crypto from "node:crypto";
+          import fs from "node:fs";
+
+          export const WEB_REPO = "veselyvaclavcz/kdobystavelsilnice";
+          export const WORKFLOW = "import.yml";
+          export const VERSIONS_URL = "https://kdobystavelsilnice.cz/epizody/verze.json";
+          const MIN = 60_000;
+          const HOUR = 60 * MIN;
+          const BREAKER_PER_DAY = 40;
+          const WAIT_FOR_IMPORT_MS = 15 * MIN;
+          export const EXPIRY_MARGIN_MS = 150 * MIN;
+          /** Plánované importy webu (první běh dne přebírá backfill). */
+          export const PLAN_SCHEDULES = ["23 0 * * *", "23 6,12,18 * * *"];
+          /** Okno měřené spotřeby repa webu (pokryje libovolné měsíční účtovací období). */
+          export const USAGE_WINDOW_MS = 31 * 24 * HOUR;
+          /** Úsporný režim: nad touto spotřebou (min) jen jeden plánovaný import denně (první běh dne). */
+          export const GUARD_MIN = 1900;
+          /**
+           * Bezpečný stav: nad touto spotřebou (min) se blíží vyčerpání výdajového limitu účtu (5 USD
+           * ≈ 600 min nad bezplatných 2 000); relé jen smaže AI obsah z webu a další importy počkají.
+           */
+          export const SAFE_MIN = 2450;
+          /** Nejhorší běh importu (časové limity jobů 8 + 10 + 3 min) a jiného workflow. */
+          export const IMPORT_WORST_MIN = 21;
+          export const OTHER_WORST_MIN = 30;
+          /** Počet jobů workflow, které běží za sebou (+1 min zaokrouhlení za každý další). */
+          export const WORKFLOW_JOBS = { "import.yml": 3, "ci.yml": 2, "oznameni.yml": 2, "deploy.yml": 1, "monitor.yml": 1 };
+          /** Odstup opakování uvízlé změny podle počtu neúspěchů za sebou (min); dál 360. */
+          export const RETRY_GAP_MIN = [0, 0, 0, 30, 60, 120, 240];
+          const SUCCESS = new Set(["success"]);
+          const NEUTRAL = new Set(["skipped", "neutral"]);
+
+          // Co web nemá: chybějící video, jiná verze AI obsahu (kromě neprioritního
+          // backfillu, ten převezme denní běh) a AI obsah, který se má odvolat.
+          export function deliverableDiff(index, versions) {
+            const episodes = new Set(Array.isArray(versions?.episodes) ? versions.episodes : []);
+            const live = versions?.ai && typeof versions.ai === "object" ? versions.ai : {};
+            const byId = new Map(index.items.map((item) => [item.youtubeId, item]));
+            const changes = [];
+            for (const item of index.items) {
+              if (!episodes.has(item.youtubeId)) changes.push(`${item.youtubeId}:zaklad`);
+              const ai = item.ai;
+              if (ai && !(ai.backfill && !ai.urgent) && live[item.youtubeId] !== ai.contentVersion) changes.push(`${item.youtubeId}:${ai.contentVersion}`);
+            }
+            for (const id of Object.keys(live)) if (!byId.get(id)?.ai) changes.push(`${id}:odvolat`);
+            return changes.sort();
+          }
+
+          // Obsah AI na živém webu, jehož ověření vyprší do 150 min (nebo údaj chybí).
+          export function expiringLive(versions, now) {
+            const live = versions?.ai && typeof versions.ai === "object" ? Object.keys(versions.ai) : [];
+            const until = versions?.verifiedUntil && typeof versions.verifiedUntil === "object" ? versions.verifiedUntil : {};
+            return live.filter((id) => !(Date.parse(until[id]) > now + EXPIRY_MARGIN_MS)).sort();
+          }
+
+          export const indexAvailable = (index) => index?.complete === true && Array.isArray(index.items) && Array.isArray(index.withdrawn);
+
+          export const digestOf = (changes) => crypto.createHash("sha256").update(changes.join("\n")).digest("hex").slice(0, 16);
+
+          const workflowFile = (run) => String(run.path || "").split("@")[0].split("/").pop();
+          export const isImportRun = (run) => workflowFile(run) === WORKFLOW;
+          const createdMs = (run) => Date.parse(run.created_at);
+
+          /**
+           * Horní odhad účtovaných minut všech běhů repa webu za 31 dní: dokončený běh = zaokrouhlená
+           * délka + 1 min za každý další job (joby za sebou), neznámé workflow 3 × délka; běžící nebo
+           * čekající běh nejhorší hodnotou (import 21 min, jiný 30 min).
+           */
+          export function usageMinutes(runs, now) {
+            let total = 0;
+            for (const run of runs) {
+              if (!(now - createdMs(run) < USAGE_WINDOW_MS)) continue;
+              const file = workflowFile(run);
+              if (run.status !== "completed") {
+                total += file === WORKFLOW ? IMPORT_WORST_MIN : OTHER_WORST_MIN;
+                continue;
+              }
+              const start = Date.parse(run.run_started_at || run.created_at);
+              const minutes = Math.max(1, Math.ceil((Date.parse(run.updated_at) - start) / MIN));
+              const jobs = WORKFLOW_JOBS[file];
+              total += jobs ? minutes + jobs - 1 : 3 * minutes;
+            }
+            return total;
+          }
+
+          /**
+           * Souvislá řada neúspěšných dokončených importů s daným názvem od posledního úspěšného
+           * importu (jakéhokoli). Úspěch řadu ukončí; nová změna (jiný název) nic nedědí.
+           */
+          export function failureStreak(runs, title) {
+            const imports = runs.filter((run) => isImportRun(run) && run.status === "completed").sort((a, b) => createdMs(b) - createdMs(a));
+            let streak = 0;
+            let last = null;
+            for (const run of imports) {
+              if (SUCCESS.has(run.conclusion)) break;
+              if (NEUTRAL.has(run.conclusion) || run.display_title !== title) continue;
+              streak++;
+              last ??= createdMs(run);
+            }
+            return { streak, last };
+          }
+
+          /** Za kolik ms smí jít další pokus téhož klíče (0 = hned). */
+          export function retryWaitMs(runs, title, now) {
+            const { streak, last } = failureStreak(runs, title);
+            if (!streak) return 0;
+            const gap = (RETRY_GAP_MIN[streak] ?? 360) * MIN;
+            return Math.max(0, last + gap - now);
+          }
+
+          /**
+           * Rozhodnutí o importu (design.md 2.7):
+           *   kind "signal" (rozdíl ze studia), "expiry" (výpadek studia), "plan" (plánovaný import);
+           *   do GUARD_MIN běžný import; nad ní bezpečný import (smaže veškerý AI obsah z webu, tím
+           *   splní i odvolání a stažení), dokud je na webu nějaký AI obsah, jinak nic.
+           */
+          export function decide({ changes = [], runs, now, kind = "signal", schedule = null, liveAiCount = 0 }) {
+            if (kind !== "plan" && !changes.length) return { action: "none", reason: "web je aktuální, není co doručit" };
+            const imports = runs.filter(isImportRun);
+            const lastDay = imports.filter((run) => now - createdMs(run) < 24 * HOUR);
+            const used = usageMinutes(runs, now);
+            const digest = kind === "signal" ? digestOf(changes) : undefined;
+            if (lastDay.length > BREAKER_PER_DAY) return { action: "breaker", digest, used, reason: `${lastDay.length} importů za 24 h, zjevná porucha` };
+            const withdrawal = kind === "expiry" || changes.some((change) => change.endsWith(":odvolat"));
+            let key = kind === "signal" ? digest : kind;
+            let inputs = kind === "plan" ? { reason: "plan", schedule } : kind === "expiry" ? { reason: "expiry" } : { digest };
+            let reason = kind === "plan" ? "plánovaný import" : kind === "expiry" ? `studio nedostupné, ${changes.length} položek s vypršujícím ověřením` : `${changes.length} změn k doručení`;
+            if (used + IMPORT_WORST_MIN > SAFE_MIN) {
+              // Bezpečný stav (u vyčerpání výdajového limitu): jen bezpečný import, který smaže veškerý
+              // AI obsah (splní tím i odvolání a stažení) a nic nového nedoručí, takže se obsah nevrací.
+              if (!liveAiCount) return { action: "budget", used, reason: `bezpečný stav: spotřeba repa ${used} min za 31 dní, web je bez AI obsahu, ${withdrawal ? "odvolávat není co" : "import počká"}` };
+              key = "safe";
+              inputs = { reason: "safe" };
+              reason = `bezpečný stav: spotřeba repa ${used} min, bezpečný import smaže AI obsah z webu${withdrawal ? " (včetně odvolávaného)" : ""}`;
+            } else if (used + IMPORT_WORST_MIN > GUARD_MIN && kind === "plan" && schedule !== PLAN_SCHEDULES[0]) {
+              // Úsporný režim (placená rezerva): prioritní doručení dál hned, plánovaný import jen první v den.
+              return { action: "budget", used, reason: `úsporný režim: spotřeba repa ${used} min za 31 dní, plánovaný import jen jednou denně` };
+            }
+            if (kind !== "plan") {
+              const wait = retryWaitMs(runs, `Import ${key}`, now);
+              if (wait > 0) return { action: "backoff", digest, used, reason: `uvízlá změna, další pokus za ${Math.ceil(wait / MIN)} min` };
+            }
+            return { action: "dispatch", key, digest, inputs, used, reason };
+          }
+
+          export async function main({ fetch: request, env, sleep, now = () => Date.now(), report }) {
+            if (!env.GH_TOKEN) throw new Error("Chybí secret WEB_IMPORT_TOKEN");
+            if (!env.STUDIO_ARCHIVE_URL) throw new Error("Chybí proměnná STUDIO_ARCHIVE_URL");
+            const github = async (path, init = {}) => {
+              const res = await request(`https://api.github.com${path}`, {
+                ...init,
+                headers: { Authorization: `Bearer ${env.GH_TOKEN}`, Accept: "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "kdobystavelsilnice-relay" },
+              });
+              if (!res.ok) throw new Error(`GitHub ${path.split("?")[0]}: HTTP ${res.status}`);
+              return res.status === 204 ? null : res.json();
+            };
+            const json = async (url) => {
+              const res = await request(url, { headers: { Accept: "application/json", "User-Agent": "kdobystavelsilnice-relay" } });
+              if (!res.ok) throw new Error(`${url.split("?")[0]}: HTTP ${res.status}`);
+              return res.json();
+            };
+            const studioIndex = () => json(`${env.STUDIO_ARCHIVE_URL.replace(/\/+$/, "")}/api/public/archive/index`);
+            const liveVersions = () => json(`${VERSIONS_URL}?t=${now()}`);
+            const finish = (decision) => {
+              const usage = decision.used === undefined ? "" : ` · spotřeba repa ${decision.used} min za 31 dní`;
+              report(`Relé: ${decision.action} – ${decision.reason}${decision.digest ? ` (otisk ${decision.digest})` : ""}${usage}`);
+              if (decision.used !== undefined && decision.used > 1600) report(`::warning::Spotřeba GitHub Actions repa webu ${decision.used} min za 31 dní (bezplatný limit účtu 2 000).`);
+              if (decision.action === "budget" || decision.action === "backoff") report(`::warning::${decision.reason}`);
+              if (decision.action === "breaker") throw new Error(`Jistič poruchy: ${decision.reason}. Import nespuštěn.`);
+              return decision;
+            };
+
+            const scheduled = env.EVENT_NAME === "schedule";
+            const plan = scheduled && PLAN_SCHEDULES.includes(env.EVENT_SCHEDULE);
+            const expiryCheck = scheduled && !plan;
+            // Hodinová kontrola výpadku studia: při dostupném indexu nic.
+            if (expiryCheck) {
+              const index = await studioIndex().catch(() => null);
+              if (indexAvailable(index)) return finish({ action: "none", reason: "studio je dostupné, obsah hlídá import" });
+            }
+
+            const workflowRuns = `/repos/${WEB_REPO}/actions/workflows/${WORKFLOW}/runs`;
+            const deadline = now() + WAIT_FOR_IMPORT_MS;
+            for (;;) {
+              // Běžící nebo čekající import: počkat na jeho konec a rozdíl ověřit znovu (změna z jeho
+              // běhu se doručí hned dalším). Když neskončí do 15 min, nový import se nespustí.
+              const active = [...(await github(`${workflowRuns}?status=in_progress`)).workflow_runs, ...(await github(`${workflowRuns}?status=queued`)).workflow_runs];
+              if (active.length) {
+                if (now() < deadline) {
+                  await sleep(30_000);
+                  continue;
+                }
+                return finish({ action: "busy", reason: "import webu pořád běží nebo čeká, další se nespouští" });
+              }
+              let changes = [];
+              let versions = null;
+              let kind = "signal";
+              if (plan) {
+                kind = "plan";
+                versions = await liveVersions().catch(() => null);
+              } else if (expiryCheck) {
+                const index = await studioIndex().catch(() => null);
+                if (indexAvailable(index)) return finish({ action: "none", reason: "studio je zase dostupné" });
+                versions = await liveVersions().catch(() => null);
+                if (!versions) return finish({ action: "none", reason: "živé verze.json nedostupné, nelze posoudit" });
+                changes = expiringLive(versions, now()).map((id) => `${id}:expirace`);
+                kind = "expiry";
+              } else {
+                const index = await studioIndex();
+                if (!indexAvailable(index)) throw new Error("Index studia není úplný");
+                versions = await liveVersions().catch(() => null);
+                changes = deliverableDiff(index, versions ?? { episodes: [], ai: {} });
+              }
+              // Všechny běhy repa webu za 31 dní (spotřeba, jistič, odstup); nejvýš 10 stránek.
+              const since = new Date(now() - USAGE_WINDOW_MS).toISOString();
+              const runs = [];
+              for (let page = 1; page <= 10; page++) {
+                const batch = (await github(`/repos/${WEB_REPO}/actions/runs?per_page=100&page=${page}&created=${encodeURIComponent(`>=${since}`)}`)).workflow_runs;
+                runs.push(...batch);
+                if (batch.length < 100) break;
+              }
+              // Bez živého verze.json se počítá s tím, že AI obsah na webu je (bezpečnější volba).
+              const liveAiCount = versions?.ai && typeof versions.ai === "object" ? Object.keys(versions.ai).length : 1;
+              const decision = decide({ changes, runs, now: now(), kind, schedule: env.EVENT_SCHEDULE || null, liveAiCount });
+              if (decision.action === "dispatch") {
+                await github(`/repos/${WEB_REPO}/actions/workflows/${WORKFLOW}/dispatches`, {
+                  method: "POST",
+                  body: JSON.stringify({ ref: "main", inputs: decision.inputs }),
+                });
+              }
+              return finish(decision);
+            }
+          }
+
+          if (!globalThis.__RELAY_TEST__) {
+            const report = (text) => {
+              console.log(text);
+              if (process.env.GITHUB_STEP_SUMMARY) fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, `${text}\n`);
+            };
+            try {
+              await main({ fetch, env: process.env, sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)), report });
+            } catch (error) {
+              report(`::error::${error.message}`);
+              process.exitCode = 1;
+            }
+          }
+          RELAY
