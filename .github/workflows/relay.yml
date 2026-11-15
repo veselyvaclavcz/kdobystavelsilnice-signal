@@ -12,10 +12,15 @@
 # na živém webu má ověření (verifiedUntil) do 150 min, spustí import s reason=expiry, který
 # ho smaže a nasadí. Při dostupném studiu hodinový běh nic nespouští.
 #
+# Jistič poruchy (víc než 40 importů za 24 h) import nespustí. Sepnutí ohlásí chybou běhu, tedy
+# e-mailem, jen první běh: další běhy téhož sepnutí najdou v historii relé neúspěšný běh dokončený
+# po jeho začátku a skončí varováním. Když historii nejde přečíst nebo doložit, hlásí chybou.
+#
 # Celý skript je v tomto souboru: žádný checkout, žádné soubory z repozitáře. Token studia
 # (jen Contents) nemůže měnit workflow; token pro web je jen v Secrets (WEB_IMPORT_TOKEN,
 # fine-grained, jen repozitář webu, Actions: Read and write). Adresa studia je proměnná
-# repozitáře STUDIO_ARCHIVE_URL (veřejné API jen pro čtení).
+# repozitáře STUDIO_ARCHIVE_URL (veřejné API jen pro čtení). Vlastní token běhu smí jen číst
+# běhy tohoto repa (actions: read).
 name: Relé
 
 on:
@@ -27,6 +32,11 @@ on:
     - cron: "23 0 * * *"
     - cron: "23 6,12,18 * * *"
   workflow_dispatch:
+    inputs:
+      history_check:
+        description: Jen ověřit čtení historie běhů (nic nespustí)
+        type: boolean
+        default: false
 
 permissions: {}
 
@@ -38,13 +48,17 @@ jobs:
   relay:
     runs-on: ubuntu-24.04
     timeout-minutes: 25
+    permissions:
+      actions: read
     steps:
       - name: Doručit změny na web
         env:
           GH_TOKEN: ${{ secrets.WEB_IMPORT_TOKEN }}
+          RELAY_TOKEN: ${{ github.token }}
           STUDIO_ARCHIVE_URL: ${{ vars.STUDIO_ARCHIVE_URL }}
           EVENT_NAME: ${{ github.event_name }}
           EVENT_SCHEDULE: ${{ github.event.schedule }}
+          HISTORY_CHECK: ${{ inputs.history_check }}
         run: |
           node --input-type=module <<'RELAY'
           import crypto from "node:crypto";
@@ -55,7 +69,12 @@ jobs:
           export const VERSIONS_URL = "https://kdobystavelsilnice.cz/epizody/verze.json";
           const MIN = 60_000;
           const HOUR = 60 * MIN;
-          const BREAKER_PER_DAY = 40;
+          const DAY = 24 * HOUR;
+          export const BREAKER_PER_DAY = 40;
+          export const RELAY_WORKFLOW = "relay.yml";
+          /** Kontrola ohlášení jističe: nejvýš tolik stránek po 100 běhech na dotaz a společný časový limit. */
+          export const HISTORY_PAGES = 10;
+          export const HISTORY_TIMEOUT_MS = 20_000;
           const WAIT_FOR_IMPORT_MS = 15 * MIN;
           export const EXPIRY_MARGIN_MS = 150 * MIN;
           /** Plánované importy webu (první běh dne přebírá backfill). */
@@ -158,6 +177,25 @@ jobs:
           }
 
           /**
+           * Začátek souvislého překročení limitu jističe, které trvá do `now`: čas (ms), null (limit teď
+           * překročen není) nebo "uncertain" (importy starší než `coveredFrom` chybí a uvolnění nejde
+           * doložit). Počet v okně 24 h roste jen s novým importem, jinak klesá: je-li těsně před pozdějším
+           * importem nad limitem, byl nad ním celé období od předchozího importu. Začátkem je tedy
+           * nejnovější import, před kterým byl počet nejvýš na limitu.
+           */
+          export function breakerSince(importTimes, now, coveredFrom = -Infinity) {
+            const times = importTimes.filter((t) => t <= now).sort((a, b) => a - b);
+            const inWindow = (t, inclusive) => times.filter((a) => a > t - DAY && (inclusive ? a <= t : a < t)).length;
+            if (inWindow(now, true) <= BREAKER_PER_DAY) return null;
+            for (let k = times.length - 1; k >= 0; k--) {
+              const at = times[k];
+              if (at - DAY < coveredFrom) return "uncertain";
+              if (inWindow(at, false) <= BREAKER_PER_DAY) return at;
+            }
+            return "uncertain";
+          }
+
+          /**
            * Rozhodnutí o importu (design.md 2.7):
            *   kind "signal" (rozdíl ze studia), "expiry" (výpadek studia), "plan" (plánovaný import);
            *   do GUARD_MIN běžný import; nad ní bezpečný import (smaže veškerý AI obsah z webu, tím
@@ -166,7 +204,7 @@ jobs:
           export function decide({ changes = [], runs, now, kind = "signal", schedule = null, liveAiCount = 0 }) {
             if (kind !== "plan" && !changes.length) return { action: "none", reason: "web je aktuální, není co doručit" };
             const imports = runs.filter(isImportRun);
-            const lastDay = imports.filter((run) => now - createdMs(run) < 24 * HOUR);
+            const lastDay = imports.filter((run) => now - createdMs(run) < DAY);
             const used = usageMinutes(runs, now);
             const digest = kind === "signal" ? digestOf(changes) : undefined;
             if (lastDay.length > BREAKER_PER_DAY) return { action: "breaker", digest, used, reason: `${lastDay.length} importů za 24 h, zjevná porucha` };
@@ -192,17 +230,77 @@ jobs:
             return { action: "dispatch", key, digest, inputs, used, reason };
           }
 
-          export async function main({ fetch: request, env, sleep, now = () => Date.now(), report }) {
+          export async function main({ fetch: request, env, sleep, now = () => Date.now(), report, historyTimeoutMs = HISTORY_TIMEOUT_MS }) {
             if (!env.GH_TOKEN) throw new Error("Chybí secret WEB_IMPORT_TOKEN");
             if (!env.STUDIO_ARCHIVE_URL) throw new Error("Chybí proměnná STUDIO_ARCHIVE_URL");
-            const github = async (path, init = {}) => {
+            const githubAs = (token) => async (path, init = {}) => {
               const res = await request(`https://api.github.com${path}`, {
                 ...init,
-                headers: { Authorization: `Bearer ${env.GH_TOKEN}`, Accept: "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "kdobystavelsilnice-relay" },
+                headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "kdobystavelsilnice-relay" },
               });
               if (!res.ok) throw new Error(`GitHub ${path.split("?")[0]}: HTTP ${res.status}`);
               return res.status === 204 ? null : res.json();
             };
+            const github = githubAs(env.GH_TOKEN);
+            const workflowRuns = `/repos/${WEB_REPO}/actions/workflows/${WORKFLOW}/runs`;
+
+            /** Časy vzniku importů webu za 31 dní; coveredFrom = -Infinity, když je historie úplná. */
+            const importHistory = async (signal) => {
+              const since = new Date(now() - USAGE_WINDOW_MS).toISOString().replace(/\.\d{3}Z$/, "Z");
+              const times = [];
+              for (let page = 1; page <= HISTORY_PAGES; page++) {
+                const batch = (await github(`${workflowRuns}?per_page=100&page=${page}&created=${encodeURIComponent(`>=${since}`)}`, { signal })).workflow_runs;
+                times.push(...batch.map(createdMs));
+                if (batch.length < 100) return { times, coveredFrom: -Infinity };
+              }
+              return { times, coveredFrom: Math.min(...times) };
+            };
+
+            /**
+             * Neúspěšné běhy relé (kromě tohoto) dokončené od `since`, bez ohledu na to, kdy vznikly
+             * (fronta, opakování starého běhu). firstOnly: stačí první nalezený. complete = false po stropu
+             * stránek (počet je pak jen dolní mez).
+             */
+            const relayFailuresSince = async (since, signal, firstOnly) => {
+              if (!env.RELAY_TOKEN || !env.GITHUB_REPOSITORY) throw new Error("chybí RELAY_TOKEN nebo GITHUB_REPOSITORY");
+              const relayGithub = githubAs(env.RELAY_TOKEN);
+              let count = 0;
+              for (let page = 1; page <= HISTORY_PAGES; page++) {
+                const batch = (await relayGithub(`/repos/${env.GITHUB_REPOSITORY}/actions/workflows/${RELAY_WORKFLOW}/runs?status=failure&per_page=100&page=${page}`, { signal })).workflow_runs;
+                count += batch.filter((run) => String(run.id) !== String(env.GITHUB_RUN_ID) && Date.parse(run.updated_at) >= since).length;
+                if ((firstOnly && count) || batch.length < 100) return { count, complete: true };
+              }
+              return { count, complete: false };
+            };
+
+            /** Ohlásil už sepnutí jističe dřívější běh relé? true, nebo důvod, proč ho ohlásit chybou. */
+            const breakerReported = async () => {
+              const signal = AbortSignal.timeout(historyTimeoutMs);
+              try {
+                const { times, coveredFrom } = await importHistory(signal);
+                const start = breakerSince(times, now(), coveredFrom);
+                if (start === null) return { why: "počet importů za 24 h mezitím klesl na limit" };
+                if (start === "uncertain") return { why: "historie importů je neúplná, začátek sepnutí nelze doložit" };
+                const { count, complete } = await relayFailuresSince(start, signal, true);
+                if (count) return { reported: true };
+                if (!complete) return { why: `víc než ${HISTORY_PAGES * 100} novějších neúspěšných běhů relé, ohlášení nelze doložit` };
+                return { first: true };
+              } catch (error) {
+                return { why: `historii běhů nelze přečíst (${error?.name === "TimeoutError" ? "časový limit" : error?.message})` };
+              }
+            };
+
+            // Ruční kontrola čtení historie po nasazení: nic nespouští, studio ani web nečte.
+            if (env.HISTORY_CHECK === "true") {
+              const signal = AbortSignal.timeout(historyTimeoutMs);
+              const { times, coveredFrom } = await importHistory(signal);
+              const failed = await relayFailuresSince(now() - DAY, signal, false);
+              const failedText = failed.complete ? failed.count : `nejméně ${failed.count} (historie selhání přes ${HISTORY_PAGES * 100} běhů, neúplná)`;
+              const coverage = coveredFrom === -Infinity ? "úplná" : "neúplná";
+              const decision = { action: "history", reason: `${times.length} importů webu za 31 dní (historie ${coverage}), ${failedText} neúspěšných běhů relé dokončených za 24 h` };
+              report(`Relé: kontrola historie – ${decision.reason}`);
+              return decision;
+            }
             const json = async (url) => {
               const res = await request(url, { headers: { Accept: "application/json", "User-Agent": "kdobystavelsilnice-relay" } });
               if (!res.ok) throw new Error(`${url.split("?")[0]}: HTTP ${res.status}`);
@@ -215,7 +313,13 @@ jobs:
               report(`Relé: ${decision.action} – ${decision.reason}${decision.digest ? ` (otisk ${decision.digest})` : ""}${usage}`);
               if (decision.used !== undefined && decision.used > 1600) report(`::warning::Spotřeba GitHub Actions repa webu ${decision.used} min za 31 dní (bezplatný limit účtu 2 000).`);
               if (decision.action === "budget" || decision.action === "backoff") report(`::warning::${decision.reason}`);
-              if (decision.action === "breaker") throw new Error(`Jistič poruchy: ${decision.reason}. Import nespuštěn.`);
+              if (decision.action === "breaker") {
+                if (decision.reported) {
+                  report(`::warning::Jistič poruchy: ${decision.reason}. Import nespuštěn. Sepnutí už ohlásil dřívější běh relé.`);
+                  return decision;
+                }
+                throw new Error(`Jistič poruchy: ${decision.reason}. Import nespuštěn.`);
+              }
               return decision;
             };
 
@@ -228,7 +332,6 @@ jobs:
               if (indexAvailable(index)) return finish({ action: "none", reason: "studio je dostupné, obsah hlídá import" });
             }
 
-            const workflowRuns = `/repos/${WEB_REPO}/actions/workflows/${WORKFLOW}/runs`;
             const deadline = now() + WAIT_FOR_IMPORT_MS;
             for (;;) {
               // Běžící nebo čekající import: počkat na jeho konec a rozdíl ověřit znovu (změna z jeho
@@ -276,6 +379,11 @@ jobs:
                   method: "POST",
                   body: JSON.stringify({ ref: "main", inputs: decision.inputs }),
                 });
+              }
+              if (decision.action === "breaker") {
+                const check = await breakerReported();
+                if (check.reported) decision.reported = true;
+                else if (check.why) report(`::warning::Jistič: ${check.why}; sepnutí se ohlásí chybou.`);
               }
               return finish(decision);
             }
