@@ -5,12 +5,19 @@
 # spustí import webu, ale jen když má web co doručit (doručitelný rozdíl mezi indexem
 # studia a živým verze.json). Opakované signály bez změny dat tedy nic nespustí.
 #
-# Plánované importy webu (první běh dne s backfillem a pak po 6 h) spouští také relé, aby každý
-# import prošel pojistkou nákladů repa webu (veřejné repo relé minuty nespotřebuje).
+# Obnova ověření (úkol 2026-11-17-rele-obnova-overeni): ověření veřejnosti videa (verifiedUntil)
+# dostane web jen s importem. Studio 60 min před jeho koncem na webu zapíše signal.json; relé pak
+# bez doručitelného rozdílu spustí import s reason=refresh (signál uzná do 90 min před koncem).
 #
-# Hodinový běh hlídá výpadek studia: když index studia není dostupný a některý obsah AI
+# Plánované importy webu (první běh dne s backfillem a pak po 6 h) spouští také relé, aby každý
+# import prošel pojistkou nákladů repa webu (veřejné repo relé minuty nespotřebuje). Plánovaný
+# import v 6/12/18 h relé přeskočí, když obnova ověření běží (web má AI obsah, který studio drží
+# čerstvě ověřený), web nemá co doručit a úspěšný import se čtením indexu proběhl do 5 h.
+#
+# Běh v :17 a :47 hlídá výpadek studia: když index studia není dostupný a některý obsah AI
 # na živém webu má ověření (verifiedUntil) do 150 min, spustí import s reason=expiry, který
-# ho smaže a nasadí. Při dostupném studiu hodinový běh nic nespouští.
+# ho smaže a nasadí. Při dostupném studiu je zálohou obnovy: když ověření na webu končí do 50 min
+# (studio hlásí už v 60 min) a import by ho posunul, spustí import; jinak nic.
 #
 # Jistič poruchy (víc než 40 importů za 24 h) import nespustí. Sepnutí ohlásí chybou běhu, tedy
 # e-mailem, jen první běh: další běhy téhož sepnutí najdou v historii relé neúspěšný běh dokončený
@@ -28,7 +35,7 @@ on:
     branches: [main]
     paths: [signal.json]
   schedule:
-    - cron: "17 * * * *"
+    - cron: "17,47 * * * *"
     - cron: "23 0 * * *"
     - cron: "23 6,12,18 * * *"
   workflow_dispatch:
@@ -95,6 +102,18 @@ jobs:
           export const WORKFLOW_JOBS = { "import.yml": 3, "ci.yml": 2, "oznameni.yml": 2, "deploy.yml": 1, "monitor.yml": 1 };
           /** Odstup opakování uvízlé změny podle počtu neúspěchů za sebou (min); dál 360. */
           export const RETRY_GAP_MIN = [0, 0, 0, 30, 60, 120, 240];
+          /** Obnova ověření: signál studia (hlásí 60 min před koncem) relé uzná do 90 min před koncem. */
+          export const SIGNAL_REFRESH_MARGIN_MS = 90 * MIN;
+          /** Záloha obnovy v běhu :17/:47 jedná až do 50 min před koncem, aby nepředběhla studio. */
+          export const BACKUP_REFRESH_MARGIN_MS = 50 * MIN;
+          /** Web uloží nové verifiedUntil jen o aspoň hodinu pozdější (archive-lib.mjs webu). */
+          export const VERIFIED_REFRESH_MS = 60 * MIN;
+          /** Plánovaný import 6/12/18 h se přeskočí po úspěšném importu se čtením indexu do 5 h ... */
+          export const PLAN_SKIP_RECENT_MS = 5 * HOUR;
+          /** ... když studio drží ověření AI obsahu na webu čerstvé (v indexu aspoň 5 h dopředu). */
+          export const PLAN_FRESH_UNTIL_MS = 5 * HOUR;
+          /** Časový limit čtení indexu studia a verze.json webu (včetně těla odpovědi). */
+          export const FETCH_TIMEOUT_MS = 20_000;
           const SUCCESS = new Set(["success"]);
           const NEUTRAL = new Set(["skipped", "neutral"]);
 
@@ -119,6 +138,42 @@ jobs:
             const live = versions?.ai && typeof versions.ai === "object" ? Object.keys(versions.ai) : [];
             const until = versions?.verifiedUntil && typeof versions.verifiedUntil === "object" ? versions.verifiedUntil : {};
             return live.filter((id) => !(Date.parse(until[id]) > now + EXPIRY_MARGIN_MS)).sort();
+          }
+
+          /**
+           * Obnova ověření (stejné pravidlo jako webRefreshDue ve studiu): AI obsah na webu, jehož
+           * verifiedUntil chybí nebo končí do `margin`, když studio má ověření aspoň o hodinu pozdější
+           * a import ho web převezme: shodná verze (web posune verifiedUntil), nebo jiná verze kromě
+           * neprioritního backfillu (ten bere web jen v denním běhu; studio ho před koncem povýší).
+           */
+          export function refreshNeeded(index, versions, now, margin) {
+            const live = versions?.ai && typeof versions.ai === "object" ? versions.ai : {};
+            const until = versions?.verifiedUntil && typeof versions.verifiedUntil === "object" ? versions.verifiedUntil : {};
+            const byId = new Map((index?.items ?? []).map((item) => [item.youtubeId, item]));
+            const due = [];
+            for (const id of Object.keys(live)) {
+              const liveUntil = Date.parse(until[id]);
+              if (liveUntil >= now + margin) continue;
+              const ai = byId.get(id)?.ai;
+              if (!ai) continue; // odvolání řeší doručitelný rozdíl
+              const studioUntil = Date.parse(ai.verifiedUntil);
+              if (!(studioUntil > now)) continue;
+              if (Number.isFinite(liveUntil) && studioUntil - liveUntil < VERIFIED_REFRESH_MS) continue;
+              if (live[id] !== ai.contentVersion && ai.backfill && !ai.urgent) continue;
+              due.push(id);
+            }
+            return due.sort();
+          }
+
+          /**
+           * Běží obnova ověření, takže plánovaný import 6/12/18 h je nadbytečný? Web nemá co doručit
+           * a aspoň jeden AI obsah na webu má ve studiu ověření aspoň 5 h dopředu (obnovy přicházejí).
+           */
+          export function refreshKeepsWebFresh(index, versions, now) {
+            if (deliverableDiff(index, versions).length) return false;
+            const live = versions?.ai && typeof versions.ai === "object" ? Object.keys(versions.ai) : [];
+            const byId = new Map(index.items.map((item) => [item.youtubeId, item]));
+            return live.some((id) => Date.parse(byId.get(id)?.ai?.verifiedUntil) >= now + PLAN_FRESH_UNTIL_MS);
           }
 
           export const indexAvailable = (index) => index?.complete === true && Array.isArray(index.items) && Array.isArray(index.withdrawn);
@@ -168,6 +223,14 @@ jobs:
             return { streak, last };
           }
 
+          /** Vznik posledního úspěšného importu, který četl index studia (ne expiry ani safe), nebo null. */
+          export function lastIndexImportAt(runs) {
+            const times = runs
+              .filter((run) => isImportRun(run) && run.status === "completed" && SUCCESS.has(run.conclusion) && !["Import expiry", "Import safe"].includes(run.display_title))
+              .map(createdMs);
+            return times.length ? Math.max(...times) : null;
+          }
+
           /** Za kolik ms smí jít další pokus téhož klíče (0 = hned). */
           export function retryWaitMs(runs, title, now) {
             const { streak, last } = failureStreak(runs, title);
@@ -197,11 +260,13 @@ jobs:
 
           /**
            * Rozhodnutí o importu (design.md 2.7):
-           *   kind "signal" (rozdíl ze studia), "expiry" (výpadek studia), "plan" (plánovaný import);
+           *   kind "signal" (rozdíl ze studia), "refresh" (obnova ověření bez rozdílu), "expiry"
+           *   (výpadek studia), "plan" (plánovaný import; `refreshFresh` = obnova běží, plán 6/12/18 h
+           *   se po nedávném importu přeskočí);
            *   do GUARD_MIN běžný import; nad ní bezpečný import (smaže veškerý AI obsah z webu, tím
            *   splní i odvolání a stažení), dokud je na webu nějaký AI obsah, jinak nic.
            */
-          export function decide({ changes = [], runs, now, kind = "signal", schedule = null, liveAiCount = 0 }) {
+          export function decide({ changes = [], runs, now, kind = "signal", schedule = null, liveAiCount = 0, refreshFresh = false }) {
             if (kind !== "plan" && !changes.length) return { action: "none", reason: "web je aktuální, není co doručit" };
             const imports = runs.filter(isImportRun);
             const lastDay = imports.filter((run) => now - createdMs(run) < DAY);
@@ -209,9 +274,17 @@ jobs:
             const digest = kind === "signal" ? digestOf(changes) : undefined;
             if (lastDay.length > BREAKER_PER_DAY) return { action: "breaker", digest, used, reason: `${lastDay.length} importů za 24 h, zjevná porucha` };
             const withdrawal = kind === "expiry" || changes.some((change) => change.endsWith(":odvolat"));
+            const daily = kind === "plan" && schedule === PLAN_SCHEDULES[0];
             let key = kind === "signal" ? digest : kind;
-            let inputs = kind === "plan" ? { reason: "plan", schedule } : kind === "expiry" ? { reason: "expiry" } : { digest };
-            let reason = kind === "plan" ? "plánovaný import" : kind === "expiry" ? `studio nedostupné, ${changes.length} položek s vypršujícím ověřením` : `${changes.length} změn k doručení`;
+            let inputs = kind === "plan" ? { reason: "plan", schedule } : kind === "signal" ? { digest } : { reason: kind };
+            let reason =
+              kind === "plan"
+                ? "plánovaný import"
+                : kind === "expiry"
+                  ? `studio nedostupné, ${changes.length} položek s vypršujícím ověřením`
+                  : kind === "refresh"
+                    ? `obnova ověření, ${changes.length} položek s končícím ověřením na webu`
+                    : `${changes.length} změn k doručení`;
             if (used + IMPORT_WORST_MIN > SAFE_MIN) {
               // Bezpečný stav (u vyčerpání výdajového limitu): jen bezpečný import, který smaže veškerý
               // AI obsah (splní tím i odvolání a stažení) a nic nového nedoručí, takže se obsah nevrací.
@@ -219,9 +292,21 @@ jobs:
               key = "safe";
               inputs = { reason: "safe" };
               reason = `bezpečný stav: spotřeba repa ${used} min, bezpečný import smaže AI obsah z webu${withdrawal ? " (včetně odvolávaného)" : ""}`;
-            } else if (used + IMPORT_WORST_MIN > GUARD_MIN && kind === "plan" && schedule !== PLAN_SCHEDULES[0]) {
-              // Úsporný režim (placená rezerva): prioritní doručení dál hned, plánovaný import jen první v den.
-              return { action: "budget", used, reason: `úsporný režim: spotřeba repa ${used} min za 31 dní, plánovaný import jen jednou denně` };
+            } else {
+              if (kind === "plan" && !daily && refreshFresh) {
+                // Obnova ověření dovezla import nedávno (YouTube, podcast, akce i archiv): plán je nadbytečný.
+                const last = lastIndexImportAt(runs);
+                if (last !== null && now - last < PLAN_SKIP_RECENT_MS) {
+                  return { action: "none", used, reason: `obnova ověření běží a web má čerstvý import (před ${Math.round((now - last) / MIN)} min), plánovaný import přeskočen` };
+                }
+              }
+              if (used + IMPORT_WORST_MIN > GUARD_MIN && kind === "plan" && !daily) {
+                // Úsporný režim (placená rezerva): prioritní doručení dál hned, plánovaný import jen první v den.
+                return { action: "budget", used, reason: `úsporný režim: spotřeba repa ${used} min za 31 dní, plánovaný import jen jednou denně` };
+              }
+              if (used + IMPORT_WORST_MIN > GUARD_MIN && kind === "refresh") {
+                return { action: "budget", used, reason: `úsporný režim: spotřeba repa ${used} min za 31 dní, obnova ověření počká` };
+              }
             }
             if (kind !== "plan") {
               const wait = retryWaitMs(runs, `Import ${key}`, now);
@@ -230,7 +315,7 @@ jobs:
             return { action: "dispatch", key, digest, inputs, used, reason };
           }
 
-          export async function main({ fetch: request, env, sleep, now = () => Date.now(), report, historyTimeoutMs = HISTORY_TIMEOUT_MS }) {
+          export async function main({ fetch: request, env, sleep, now = () => Date.now(), report, historyTimeoutMs = HISTORY_TIMEOUT_MS, fetchTimeoutMs = FETCH_TIMEOUT_MS }) {
             if (!env.GH_TOKEN) throw new Error("Chybí secret WEB_IMPORT_TOKEN");
             if (!env.STUDIO_ARCHIVE_URL) throw new Error("Chybí proměnná STUDIO_ARCHIVE_URL");
             const githubAs = (token) => async (path, init = {}) => {
@@ -301,10 +386,17 @@ jobs:
               report(`Relé: kontrola historie – ${decision.reason}`);
               return decision;
             }
+            // Index studia a verze.json: časový limit na celou odpověď včetně těla (zaseknutí = chyba).
             const json = async (url) => {
-              const res = await request(url, { headers: { Accept: "application/json", "User-Agent": "kdobystavelsilnice-relay" } });
-              if (!res.ok) throw new Error(`${url.split("?")[0]}: HTTP ${res.status}`);
-              return res.json();
+              const signal = AbortSignal.timeout(fetchTimeoutMs);
+              try {
+                const res = await request(url, { headers: { Accept: "application/json", "User-Agent": "kdobystavelsilnice-relay" }, signal });
+                if (!res.ok) throw new Error(`${url.split("?")[0]}: HTTP ${res.status}`);
+                return await res.json();
+              } catch (error) {
+                if (signal.aborted) throw new Error(`${url.split("?")[0]}: časový limit ${Math.round(fetchTimeoutMs / 1000)} s`);
+                throw error;
+              }
             };
             const studioIndex = () => json(`${env.STUDIO_ARCHIVE_URL.replace(/\/+$/, "")}/api/public/archive/index`);
             const liveVersions = () => json(`${VERSIONS_URL}?t=${now()}`);
@@ -326,10 +418,15 @@ jobs:
             const scheduled = env.EVENT_NAME === "schedule";
             const plan = scheduled && PLAN_SCHEDULES.includes(env.EVENT_SCHEDULE);
             const expiryCheck = scheduled && !plan;
-            // Hodinová kontrola výpadku studia: při dostupném indexu nic.
+            // Kontrola výpadku studia (:17, :47): při dostupném studiu jen záloha obnovy ověření; když
+            // obnova potřeba není, nic (ani čtení GitHubu).
             if (expiryCheck) {
               const index = await studioIndex().catch(() => null);
-              if (indexAvailable(index)) return finish({ action: "none", reason: "studio je dostupné, obsah hlídá import" });
+              if (indexAvailable(index)) {
+                const versions = await liveVersions().catch(() => null);
+                if (!versions) return finish({ action: "none", reason: "studio je dostupné, živé verze.json nedostupné" });
+                if (!refreshNeeded(index, versions, now(), BACKUP_REFRESH_MARGIN_MS).length) return finish({ action: "none", reason: "studio je dostupné, ověření na webu platí" });
+              }
             }
 
             const deadline = now() + WAIT_FOR_IMPORT_MS;
@@ -347,21 +444,39 @@ jobs:
               let changes = [];
               let versions = null;
               let kind = "signal";
+              let refreshFresh = false;
+              // Bez doručitelného rozdílu obnova ověření (změny `<id>:obnova`), je-li potřeba.
+              const refreshOr = (index, margin) => {
+                changes = deliverableDiff(index, versions);
+                if (changes.length) return;
+                changes = refreshNeeded(index, versions, now(), margin).map((id) => `${id}:obnova`);
+                if (changes.length) kind = "refresh";
+              };
               if (plan) {
                 kind = "plan";
                 versions = await liveVersions().catch(() => null);
+                if (versions && env.EVENT_SCHEDULE !== PLAN_SCHEDULES[0]) {
+                  const index = await studioIndex().catch(() => null);
+                  refreshFresh = indexAvailable(index) && refreshKeepsWebFresh(index, versions, now());
+                }
               } else if (expiryCheck) {
                 const index = await studioIndex().catch(() => null);
-                if (indexAvailable(index)) return finish({ action: "none", reason: "studio je zase dostupné" });
                 versions = await liveVersions().catch(() => null);
                 if (!versions) return finish({ action: "none", reason: "živé verze.json nedostupné, nelze posoudit" });
-                changes = expiringLive(versions, now()).map((id) => `${id}:expirace`);
-                kind = "expiry";
+                if (indexAvailable(index)) {
+                  // Záloha obnovy: s rozdílem běžný import (doručí verzi i ověření), jinak obnova.
+                  if (!refreshNeeded(index, versions, now(), BACKUP_REFRESH_MARGIN_MS).length) return finish({ action: "none", reason: "ověření na webu je obnovené" });
+                  refreshOr(index, BACKUP_REFRESH_MARGIN_MS);
+                } else {
+                  changes = expiringLive(versions, now()).map((id) => `${id}:expirace`);
+                  kind = "expiry";
+                }
               } else {
                 const index = await studioIndex();
                 if (!indexAvailable(index)) throw new Error("Index studia není úplný");
                 versions = await liveVersions().catch(() => null);
-                changes = deliverableDiff(index, versions ?? { episodes: [], ai: {} });
+                if (versions) refreshOr(index, SIGNAL_REFRESH_MARGIN_MS);
+                else changes = deliverableDiff(index, { episodes: [], ai: {} });
               }
               // Všechny běhy repa webu za 31 dní (spotřeba, jistič, odstup); nejvýš 10 stránek.
               const since = new Date(now() - USAGE_WINDOW_MS).toISOString();
@@ -373,7 +488,7 @@ jobs:
               }
               // Bez živého verze.json se počítá s tím, že AI obsah na webu je (bezpečnější volba).
               const liveAiCount = versions?.ai && typeof versions.ai === "object" ? Object.keys(versions.ai).length : 1;
-              const decision = decide({ changes, runs, now: now(), kind, schedule: env.EVENT_SCHEDULE || null, liveAiCount });
+              const decision = decide({ changes, runs, now: now(), kind, schedule: env.EVENT_SCHEDULE || null, liveAiCount, refreshFresh });
               if (decision.action === "dispatch") {
                 await github(`/repos/${WEB_REPO}/actions/workflows/${WORKFLOW}/dispatches`, {
                   method: "POST",
